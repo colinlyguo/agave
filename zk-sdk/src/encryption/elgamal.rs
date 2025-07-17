@@ -768,7 +768,7 @@ define_mul_variants!(
 /// Decryption handle for Pedersen commitment.
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-pub struct DecryptHandle(RistrettoPoint);
+pub struct DecryptHandle(pub RistrettoPoint);
 impl DecryptHandle {
     pub fn new(public: &ElGamalPubkey, opening: &PedersenOpening) -> Self {
         Self(&public.0 * opening.get_scalar())

